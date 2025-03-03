@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"strings"
 
+	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/highlight"
 
 	"github.com/sergi/go-diff/diffmatchpatch"
@@ -106,7 +107,11 @@ func (hcd *highlightCodeDiff) diffWithHighlight(filename, language, codeA, codeB
 	return diffs
 }
 
-func (hcd *highlightCodeDiff) diffWithFullFileHighlight(codeA, codeB template.HTML) []diffmatchpatch.Diff {
+// diffWithEntireFileHighlight accepts `template.HTML as arguments. Which should be code that is
+// already highlighted by `highlightEntireFile`.
+// diffWithEntireFileHighlight is line by line code that is responsible for adding
+// `added-code` and `removed-code` spans.
+func (hcd *highlightCodeDiff) diffWithEntireFileHighlight(codeA, codeB template.HTML) []diffmatchpatch.Diff {
 	hcd.collectUsedRunes(string(codeA))
 	hcd.collectUsedRunes(string(codeB))
 
@@ -120,6 +125,25 @@ func (hcd *highlightCodeDiff) diffWithFullFileHighlight(codeA, codeB template.HT
 		hcd.recoverOneDiff(&diffs[i])
 	}
 	return diffs
+}
+
+func highlightEntireFile(commit *git.Commit, diffFile *DiffFile) []template.HTML {
+	var lines []template.HTML
+
+	if commit != nil {
+		oldBlob, err := commit.GetBlobByPath(diffFile.Name)
+		if err == nil {
+			oldContent, _ := oldBlob.GetBlobContent(oldBlob.Size())
+			highlightedOldContent, _ := highlight.Code(diffFile.Name, diffFile.Language, oldContent)
+
+			splitLines := strings.Split(string(highlightedOldContent), "\n")
+			for _, line := range splitLines {
+				lines = append(lines, template.HTML(line))
+			}
+		}
+	}
+
+	return lines
 }
 
 // convertToPlaceholders totally depends on Chroma's valid HTML output and its structure, do not use these functions for other purposes.

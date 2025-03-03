@@ -345,7 +345,7 @@ func (diffSection *DiffSection) getComputedInlineDiffForHunk(diffLine *DiffLine,
 	return DiffInlineWithUnicodeEscape(template.HTML(diffHTML), locale)
 }
 
-func (diffSection *DiffSection) getComputedInlineDiffForFullFile(diffLine *DiffLine, locale translation.Locale) DiffInline {
+func (diffSection *DiffSection) getComputedInlineDiffForEntireFile(diffLine *DiffLine, locale translation.Locale) DiffInline {
 	if setting.Git.DisableDiffHighlight {
 		return getLineContent(diffLine.Content[1:], locale)
 	}
@@ -386,7 +386,7 @@ func (diffSection *DiffSection) getComputedInlineDiffForFullFile(diffLine *DiffL
 	}
 
 	hcd := newHighlightCodeDiff()
-	diffRecord := hcd.diffWithFullFileHighlight(diff1, diff2)
+	diffRecord := hcd.diffWithEntireFileHighlight(diff1, diff2)
 	// it seems that Gitea doesn't need the line wrapper of Chroma, so do not add them back
 	// if the line wrappers are still needed in the future, it can be added back by "diffToHTML(hcd.lineWrapperTags. ...)"
 	diffHTML := diffToHTML(nil, diffRecord, diffLine.Type)
@@ -398,8 +398,8 @@ func (diffSection *DiffSection) GetComputedInlineDiffFor(diffLine *DiffLine, loc
 	if diffSection.file == nil {
 		return diffSection.getComputedInlineDiffForHunk(diffLine, locale)
 	}
-	if diffSection.file.shouldHighlightEntireFile {
-		return diffSection.getComputedInlineDiffForFullFile(diffLine, locale)
+	if diffSection.file.shouldHighlightEntireFile() {
+		return diffSection.getComputedInlineDiffForEntireFile(diffLine, locale)
 	}
 	return diffSection.getComputedInlineDiffForHunk(diffLine, locale)
 }
@@ -433,9 +433,10 @@ type DiffFile struct {
 	IsSubmodule       bool // if IsSubmodule==true, then there must be a SubmoduleDiffInfo
 	SubmoduleDiffInfo *SubmoduleDiffInfo
 
-	shouldHighlightEntireFile bool
-	highlightedOldLines       []template.HTML
-	highlightedNewLines       []template.HTML
+	oldFileSize         int64
+	newFileSize         int64
+	highlightedOldLines []template.HTML
+	highlightedNewLines []template.HTML
 }
 
 // GetType returns type of diff file.
@@ -500,44 +501,24 @@ func (diffFile *DiffFile) ModeTranslationKey(mode string) string {
 	}
 }
 
-func (diffFile *DiffFile) getLineCount(commit *git.Commit) (int, error) {
-	blob, err := commit.GetBlobByPath(diffFile.GetDiffFileName())
-	if err != nil {
-		return 0, err
-	}
-	return blob.GetBlobLineCount()
-}
-
-func (diffFile *DiffFile) determineHighlightStrategy(commit, beforeCommit *git.Commit) {
-	diffFile.shouldHighlightEntireFile = true
-	if commit == nil {
-		diffFile.shouldHighlightEntireFile = false
+func (diffFile *DiffFile) shouldHighlightEntireFile() bool {
+	if diffFile == nil {
+		return false
 	}
 
-	currentLineCount, err := diffFile.getLineCount(commit)
-	if err != nil {
-		log.Debug("could not retrieve line count for current commit file - reverting to hunk based highlighting")
-		diffFile.shouldHighlightEntireFile = false
+	if diffFile.oldFileSize == 0 || diffFile.newFileSize == 0 {
+		return false
 	}
 
-	beforeLineCount := 0
-	if beforeCommit != nil {
-		// it's possible that the current commit is the first commit
-		// this would make the before commit nil
-		beforeLineCount, err = diffFile.getLineCount(beforeCommit)
-		if err != nil {
-			log.Debug("could not retrieve line count for previous commit file - reverting to hunk based highlighting")
-			diffFile.shouldHighlightEntireFile = false
-		}
+	if diffFile.oldFileSize/1024 > setting.Git.MaxDiffHighlightFileSize {
+		return false
 	}
 
-	if beforeLineCount > int(setting.Git.MaxDiffHighlightFileSize) || currentLineCount > int(setting.Git.MaxDiffHighlightFileSize) {
-		diffFile.shouldHighlightEntireFile = false
+	if diffFile.newFileSize/1024 > setting.Git.MaxDiffHighlightFileSize {
+		return false
 	}
 
-	if diffFile.shouldHighlightEntireFile {
-		diffFile.highlightedOldLines, diffFile.highlightedNewLines = highlightEntireFile(commit, beforeCommit, diffFile)
-	}
+	return true
 }
 
 func getCommitFileLineCount(commit *git.Commit, filePath string) int {
@@ -1329,7 +1310,25 @@ func GetDiff(ctx context.Context, gitRepo *git.Repository, opts *DiffOptions, fi
 		}
 		diffFile.IsGenerated = isGenerated.Value()
 
-		diffFile.determineHighlightStrategy(commit, beforeCommit)
+		newBlob, err := commit.GetBlobByPath(diffFile.GetDiffFileName())
+		if err == nil {
+			diffFile.newFileSize = newBlob.Size()
+		}
+
+		if beforeCommit != nil {
+			oldBlob, err := beforeCommit.GetBlobByPath(diffFile.GetDiffFileName())
+			if err == nil {
+				diffFile.oldFileSize = oldBlob.Size()
+			}
+		} else {
+			// if beforeCommit is nil, it might be the first commit
+			diffFile.oldFileSize = 0
+		}
+
+		if diffFile.shouldHighlightEntireFile() {
+			diffFile.highlightedOldLines = highlightEntireFile(beforeCommit, diffFile)
+			diffFile.highlightedNewLines = highlightEntireFile(commit, diffFile)
+		}
 
 		tailSection := diffFile.GetTailSection(gitRepo, beforeCommit, commit)
 		if tailSection != nil {
@@ -1349,37 +1348,6 @@ func GetDiff(ctx context.Context, gitRepo *git.Repository, opts *DiffOptions, fi
 	diff.NumFiles, diff.TotalAddition, diff.TotalDeletion = stats.NumFiles, stats.TotalAddition, stats.TotalDeletion
 
 	return diff, nil
-}
-
-func highlightEntireFile(commit, beforeCommit *git.Commit, diffFile *DiffFile) ([]template.HTML, []template.HTML) {
-	var oldLines []template.HTML
-	var newLines []template.HTML
-
-	if beforeCommit != nil {
-		oldBlob, err := beforeCommit.GetBlobByPath(diffFile.Name)
-		if err == nil {
-			oldContent, _ := oldBlob.GetBlobContent(oldBlob.Size())
-			highlightedOldContent, _ := highlight.Code(diffFile.Name, diffFile.Language, oldContent)
-
-			splitLines := strings.Split(string(highlightedOldContent), "\n")
-			for _, line := range splitLines {
-				oldLines = append(oldLines, template.HTML(line))
-			}
-		}
-	}
-
-	newBlob, err := commit.GetBlobByPath(diffFile.Name)
-	if err == nil {
-		newContent, _ := newBlob.GetBlobContent(newBlob.Size())
-		highlightedNewContent, _ := highlight.Code(diffFile.Name, diffFile.Language, newContent)
-
-		splitLines := strings.Split(string(highlightedNewContent), "\n")
-		for _, line := range splitLines {
-			newLines = append(newLines, template.HTML(line))
-		}
-	}
-
-	return oldLines, newLines
 }
 
 type PullDiffStats struct {
